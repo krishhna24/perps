@@ -1,0 +1,147 @@
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://perps:perps@postgres:5432/perps
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_URL: redis://redis:6379
+  S3_ENDPOINT: http://localstack:4566
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  JWT_SECRET: dev-jwt-secret-change-me
+  JWT_REFRESH_SECRET: dev-jwt-refresh-secret-change-me
+  INTERNAL_SERVICE_KEY: dev-internal-service-key
+  MARKET_ID: cmqgd206q00002bxy0wavuaff
+
+x-app: &app
+  build:
+    context: .
+  image: perps-app:latest
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+    init:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: perps
+      POSTGRES_PASSWORD: perps
+      POSTGRES_DB: perps
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U perps" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  localstack:
+    image: localstack/localstack:3
+    restart: unless-stopped
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      DEFAULT_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:4566/_localstack/health" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  init:
+    build:
+      context: .
+    image: perps-app:latest
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://perps:perps@postgres:5432/perps
+      MARKET_ID: cmqgd206q00002bxy0wavuaff
+    command: [ "sh", "scripts/init.sh" ]
+
+  server:
+    <<: *app
+    environment:
+      <<: *app-env
+      PORT: "3000"
+    command: [ "bun", "apps/server/src/index.ts" ]
+    ports:
+      - "3000:3000"
+
+  engine:
+    <<: *app
+    environment:
+      <<: *app-env
+      S3_BUCKET: perps-engine
+      ENGINE_KEY: engine-snapshot.json
+    command: [ "bun", "services/engine/src/index.ts" ]
+
+  persistence:
+    <<: *app
+    environment:
+      <<: *app-env
+      S3_BUCKET: perps-events
+    command: [ "bun", "services/persistence/src/index.ts" ]
+
+  websocket:
+    <<: *app
+    environment:
+      <<: *app-env
+      PORT: "8080"
+    command: [ "bun", "services/websocket/src/index.ts" ]
+    ports:
+      - "8080:8080"
+
+  mark-price-engine:
+    <<: *app
+    environment:
+      <<: *app-env
+    command: [ "bun", "services/mark-price-engine/src/index.ts" ]
+
+  funding-rate-scheduler:
+    <<: *app
+    environment:
+      <<: *app-env
+    command: [ "bun", "services/funding-rate-scheduler/src/index.ts" ]
+
+  liquidation-engine:
+    <<: *app
+    environment:
+      <<: *app-env
+      API_URL: http://server:3000
+    command: [ "bun", "services/liquidation-engine/src/index.ts" ]
+
+volumes:
+  postgres_data:
+  redis_data:
+  localstack_data:

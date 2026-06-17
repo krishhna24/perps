@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+**/dist
+**/.next
+**/generated
+.git
+.github
+.turbo
+**/.turbo
+**/*.log
+**/.env
+**/.DS_Store
