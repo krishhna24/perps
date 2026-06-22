@@ -1,17 +1,16 @@
 
 x-app-env: &app-env
-  DATABASE_URL: postgresql://perps:perps@postgres:5432/perps
+  DATABASE_URL: postgresql://perps:${POSTGRES_PASSWORD:-perps}@postgres:5432/perps
   REDIS_HOST: redis
   REDIS_PORT: "6379"
-  REDIS_URL: redis://redis:6379
   S3_ENDPOINT: http://localstack:4566
   AWS_REGION: us-east-1
-  AWS_ACCESS_KEY_ID: test
-  AWS_SECRET_ACCESS_KEY: test
-  JWT_SECRET: dev-jwt-secret-change-me
-  JWT_REFRESH_SECRET: dev-jwt-refresh-secret-change-me
-  INTERNAL_SERVICE_KEY: dev-internal-service-key
-  MARKET_ID: cmqgd206q00002bxy0wavuaff
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET in .env}
+  INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY:?set INTERNAL_SERVICE_KEY in .env}
+  MARKET_ID: ${MARKET_ID:?set MARKET_ID in .env}
 
 x-app: &app
   build:
@@ -34,7 +33,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: perps
-      POSTGRES_PASSWORD: perps
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-perps}
       POSTGRES_DB: perps
     ports:
       - "5432:5432"
@@ -85,8 +84,8 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://perps:perps@postgres:5432/perps
-      MARKET_ID: cmqgd206q00002bxy0wavuaff
+      DATABASE_URL: postgresql://perps:${POSTGRES_PASSWORD:-perps}@postgres:5432/perps
+      MARKET_ID: ${MARKET_ID:?set MARKET_ID in .env}
     command: [ "sh", "scripts/init.sh" ]
 
   server:
@@ -97,6 +96,12 @@ services:
     command: [ "bun", "apps/server/src/index.ts" ]
     ports:
       - "3000:3000"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:3000/health || exit 1" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   engine:
     <<: *app
@@ -105,6 +110,12 @@ services:
       S3_BUCKET: perps-engine
       ENGINE_KEY: engine-snapshot.json
     command: [ "bun", "services/engine/src/index.ts" ]
+    healthcheck:
+      test: [ "CMD-SHELL", "pgrep -f 'services/engine/src/index.ts' || exit 1" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   persistence:
     <<: *app
@@ -112,6 +123,12 @@ services:
       <<: *app-env
       S3_BUCKET: perps-events
     command: [ "bun", "services/persistence/src/index.ts" ]
+    healthcheck:
+      test: [ "CMD-SHELL", "pgrep -f 'services/persistence/src/index.ts' || exit 1" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   websocket:
     <<: *app
@@ -121,18 +138,36 @@ services:
     command: [ "bun", "services/websocket/src/index.ts" ]
     ports:
       - "8080:8080"
+    healthcheck:
+      test: [ "CMD-SHELL", "pgrep -f 'services/websocket/src/index.ts' || exit 1" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   mark-price-engine:
     <<: *app
     environment:
       <<: *app-env
     command: [ "bun", "services/mark-price-engine/src/index.ts" ]
+    healthcheck:
+      test: [ "CMD-SHELL", "pgrep -f 'services/mark-price-engine/src/index.ts' || exit 1" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   funding-rate-scheduler:
     <<: *app
     environment:
       <<: *app-env
     command: [ "bun", "services/funding-rate-scheduler/src/index.ts" ]
+    healthcheck:
+      test: [ "CMD-SHELL", "pgrep -f 'services/funding-rate-scheduler/src/index.ts' || exit 1" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   liquidation-engine:
     <<: *app
@@ -140,6 +175,12 @@ services:
       <<: *app-env
       API_URL: http://server:3000
     command: [ "bun", "services/liquidation-engine/src/index.ts" ]
+    healthcheck:
+      test: [ "CMD-SHELL", "pgrep -f 'services/liquidation-engine/src/index.ts' || exit 1" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
 volumes:
   postgres_data:
