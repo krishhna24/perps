@@ -84,10 +84,11 @@ model Market {
   takerFeeBps           Int     @default(0)
   makerFeeBps           Int     @default(0)
 
-  orders       Order[]
-  positions    Position[]
-  fundingRates FundingRate[]
-  fills        Fill[]
+  orders        Order[]
+  positions     Position[]
+  fundingRates  FundingRate[]
+  fills         Fill[]
+  insuranceFund InsuranceFund?
 }
 
 model Order {
@@ -207,6 +208,57 @@ model Depth {
   updatedAt DateTime @updatedAt
 }
 
+model InsuranceFund {
+  id String @id @default(cuid())
+
+  marketId String @unique
+
+  balance Decimal @default(0) @db.Decimal(30, 8)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  market Market @relation(fields: [marketId], references: [id])
+}
+
+model Journal {
+  id String @id @default(cuid())
+
+  seq BigInt @default(autoincrement())
+
+  userId   String?
+  marketId String?
+
+  account JournalAccount
+  delta   Decimal        @db.Decimal(30, 8)
+
+  refType String
+  refId   String
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, seq])
+  @@index([refType, refId])
+}
+
+model CommandOutbox {
+  seq BigInt @id @default(autoincrement())
+
+  commandId String @unique
+
+  marketId String
+
+  type    String
+  payload Json
+
+  status OutboxStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  relayedAt DateTime?
+
+  @@index([status, seq])
+}
+
 enum PositionStatus {
   OPEN
   CLOSED
@@ -228,6 +280,8 @@ enum OrderStatus {
   PARTIALLY_FILLED
   FILLED
   CANCELLED
+  REJECTED
+  EXPIRED
 }
 
 enum LedgerEntryType {
@@ -239,4 +293,18 @@ enum LedgerStatus {
   PENDING
   APPLIED
   REJECTED
+}
+
+enum JournalAccount {
+  AVAILABLE
+  LOCKED
+  INSURANCE
+  PNL
+  FEE
+  FUNDING
+}
+
+enum OutboxStatus {
+  PENDING
+  RELAYED
 }

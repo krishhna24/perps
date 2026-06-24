@@ -8,6 +8,7 @@ const adapter = new PrismaPg({ connectionString });
 const prisma = new PrismaClient({ adapter });
 
 export { prisma };
+export { Prisma } from "../generated/prisma/client.js";
 export type {
   User,
   Balance,
@@ -18,6 +19,9 @@ export type {
   FundingRate,
   Depth,
   LedgerEntry,
+  InsuranceFund,
+  Journal,
+  CommandOutbox,
 } from "../generated/prisma/client.js";
 export type {
   TradeSide,
@@ -26,4 +30,6 @@ export type {
   PositionStatus,
   LedgerEntryType,
   LedgerStatus,
+  JournalAccount,
+  OutboxStatus,
 } from "../generated/prisma/enums.js";
