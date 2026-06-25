@@ -1,4 +1,5 @@
 import { createClient } from "redis";
+import { redisSocket } from "./connection.js";
 
 type RedisClient = ReturnType<typeof createClient>;
 
@@ -7,14 +8,11 @@ export class SubscriptionManager {
   private client: RedisClient;
 
   private constructor() {
-    this.client = createClient({ url: process.env["REDIS_URL"] });
-
-
+    this.client = createClient({ socket: redisSocket() });
 
     this.client.on("error", (err: unknown) => console.error("Redis subscriber error:", err));
     void this.client.connect().catch((err: unknown) => {
-      console.error("Redis connection failed (subscriber):", err);
-      process.exit(1);
+      console.error("Redis connection failed (subscriber), retrying:", err);
     });
   }
 

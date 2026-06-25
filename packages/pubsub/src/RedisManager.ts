@@ -1,4 +1,5 @@
 import { createClient } from "redis";
+import { redisSocket } from "./connection.js";
 
 type RedisClient = ReturnType<typeof createClient>;
 
@@ -7,12 +8,11 @@ export class RedisManager {
   private client: RedisClient;
 
   private constructor() {
-    this.client = createClient({ url: process.env["REDIS_URL"] });
+    this.client = createClient({ socket: redisSocket() });
 
     this.client.on("error", (err: unknown) => console.error("Redis publisher error:", err));
     void this.client.connect().catch((err: unknown) => {
-      console.error("Redis connection failed (publisher):", err);
-      process.exit(1);
+      console.error("Redis connection failed (publisher), retrying:", err);
     });
   }
 
@@ -27,12 +27,7 @@ export class RedisManager {
     void this.client.publish(channel, JSON.stringify(message));
   }
 
-
   publishToChannel(channel: string, message: unknown): void {
     this.publish(channel, message);
-  }
-
-  updateHash(key: string, data: Record<string, string>): void {
-    void this.client.hSet(key, data);
   }
 }
