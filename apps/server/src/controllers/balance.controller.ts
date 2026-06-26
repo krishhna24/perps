@@ -1,8 +1,10 @@
 import type { Response } from "express";
 import type { AuthRequest } from "../middlewares/auth.middleware.js";
 import { depositSchema, withdrawSchema } from "@repo/types";
-import { prisma } from "@repo/db";
-import { addBalanceToQueue } from "@repo/queue";
+import { prisma, Prisma } from "@repo/db";
+import { toEngineBalanceCommand } from "@repo/queue";
+
+const BALANCE_MARKET = "GLOBAL";
 
 export const getBalance = async (
   req: AuthRequest,
@@ -28,7 +30,6 @@ export const getBalance = async (
   }
 }
 
-
 export const deposit = async (
   req: AuthRequest,
   res: Response
@@ -48,10 +49,20 @@ export const deposit = async (
     const userId = req.userId!;
     const { amount } = parsed.data;
 
-    const entry = await prisma.ledgerEntry.create({
-      data: { userId, type: "DEPOSIT", amount },
+    const entry = await prisma.$transaction(async (tx) => {
+      const e = await tx.ledgerEntry.create({
+        data: { userId, type: "DEPOSIT", amount },
+      });
+      await tx.commandOutbox.create({
+        data: {
+          commandId: `${e.id}__BALANCE-DEPOSIT`,
+          marketId: BALANCE_MARKET,
+          type: "BALANCE-DEPOSIT",
+          payload: toEngineBalanceCommand(e, "BALANCE-DEPOSIT") as unknown as Prisma.InputJsonValue,
+        },
+      });
+      return e;
     });
-    await addBalanceToQueue(entry);
 
     res.status(202).json({
       message: "Deposit accepted",
@@ -82,10 +93,20 @@ export const withdraw = async (
     const userId = req.userId!;
     const { amount } = parsed.data;
 
-    const entry = await prisma.ledgerEntry.create({
-      data: { userId, type: "WITHDRAW", amount },
+    const entry = await prisma.$transaction(async (tx) => {
+      const e = await tx.ledgerEntry.create({
+        data: { userId, type: "WITHDRAW", amount },
+      });
+      await tx.commandOutbox.create({
+        data: {
+          commandId: `${e.id}__BALANCE-WITHDRAW`,
+          marketId: BALANCE_MARKET,
+          type: "BALANCE-WITHDRAW",
+          payload: toEngineBalanceCommand(e, "BALANCE-WITHDRAW") as unknown as Prisma.InputJsonValue,
+        },
+      });
+      return e;
     });
-    await addBalanceToQueue(entry);
 
     res.status(202).json({
       message: "Withdrawal accepted",

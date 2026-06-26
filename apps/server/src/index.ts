@@ -6,11 +6,11 @@ import "dotenv/config";
 import { prisma } from "@repo/db";
 import { eventQueue } from "@repo/queue";
 import router from "./routes/index.routes.js";
+import { createRateLimiter } from "./middlewares/rateLimit.js";
+import { RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX } from "./config/env.js";
 
 const app = express();
 app.disable("x-powered-by");
-
-
 
 const securityHeaders = (_req: Request, res: Response, next: NextFunction): void => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -21,17 +21,22 @@ const securityHeaders = (_req: Request, res: Response, next: NextFunction): void
   next();
 };
 
-
-
 const corsOrigin = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(",").map((o) => o.trim())
-  : true;
+  : ["http://localhost:3001"];
 app.use(securityHeaders);
 app.use(cors({ origin: corsOrigin, credentials: true }));
-app.use(express.json({ limit: "100kb" }));
+app.use(
+  express.json({
+    limit: "100kb",
+    verify: (req, _res, buf) => {
+      (req as unknown as { rawBody?: string }).rawBody = buf.toString("utf8");
+    },
+  }),
+);
 app.use(cookieParser());
+app.use("/api", createRateLimiter({ windowMs: RATE_LIMIT_WINDOW_MS, max: RATE_LIMIT_MAX }));
 app.use("/api", router);
-
 
 const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
   Promise.race([
@@ -41,14 +46,12 @@ const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
     ),
   ]);
 
-
 app.get("/health", async (_req, res) => {
   const checks = { postgres: false, redis: false };
   try {
     await withTimeout(prisma.$queryRaw`SELECT 1`, 1000);
     checks.postgres = true;
   } catch {
-
   }
   try {
 
@@ -58,18 +61,16 @@ app.get("/health", async (_req, res) => {
     await withTimeout(client.ping(), 1000);
     checks.redis = true;
   } catch {
-
   }
   const ok = checks.postgres && checks.redis;
   res.status(ok ? 200 : 503).json({ status: ok ? "ok" : "degraded", checks });
 });
 
-const port = process.env.PORT || 3001;
+const port = process.env.PORT || 3000;
 
 const server = app.listen(port, () => {
   console.log(`SERVER RUNNING ON : ${port}`);
 });
-
 
 const shutdown = (signal: string): void => {
   console.log(`${signal} received — closing HTTP server`);

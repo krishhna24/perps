@@ -1,8 +1,8 @@
 import type { Response } from "express";
 import type { AuthRequest } from "../middlewares/auth.middleware.js";
 import type { Position } from "@repo/db";
-import { prisma } from "@repo/db";
-import { addToQueue } from "@repo/queue";
+import { prisma, Prisma } from "@repo/db";
+import { toEngineOrder } from "@repo/queue";
 
 const toPositionDTO = (p: Position) => ({
   id: p.id,
@@ -62,18 +62,27 @@ export const closePosition = async (
     }
 
     const closingSide = position.size.greaterThan(0) ? "SHORT" : "LONG";
-    const order = await prisma.order.create({
-      data: {
-        userId,
-        marketId: position.marketId,
-        side: closingSide,
-        orderType: "MARKET",
-        quantity: position.size.abs(),
-        leverage: position.leverage,
-      },
+    const order = await prisma.$transaction(async (tx) => {
+      const created = await tx.order.create({
+        data: {
+          userId,
+          marketId: position.marketId,
+          side: closingSide,
+          orderType: "MARKET",
+          quantity: position.size.abs(),
+          leverage: position.leverage,
+        },
+      });
+      await tx.commandOutbox.create({
+        data: {
+          commandId: `${created.id}__MARKET-CREATE`,
+          marketId: created.marketId,
+          type: "MARKET-CREATE",
+          payload: toEngineOrder(created, "MARKET-CREATE") as unknown as Prisma.InputJsonValue,
+        },
+      });
+      return created;
     });
-
-    await addToQueue(order, "MARKET-CREATE");
 
     res.status(202).json({
       message: "Closing order submitted",

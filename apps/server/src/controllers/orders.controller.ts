@@ -2,9 +2,9 @@ import type { Response } from "express";
 import type { AuthRequest } from "../middlewares/auth.middleware.js";
 import type { InternalAuthRequest } from "../middlewares/internalAuth.middleware.js";
 import type { Order } from "@repo/db";
-import { prisma } from "@repo/db";
+import { prisma, Prisma } from "@repo/db";
 import { createOrderSchema, mul, div, sub, gt, gte, toFixedString, Decimal, type DecimalInput } from "@repo/types";
-import { addToQueue } from "@repo/queue";
+import { toEngineOrder, type EngineOrderAction } from "@repo/queue";
 
 const MARKET_NOT_FOUND = "MARKET_NOT_FOUND";
 const INSUFFICIENT_MARGIN = "INSUFFICIENT_MARGIN";
@@ -19,7 +19,6 @@ interface MarketConstraints {
   tickSize: { toString: () => string };
   maxLeverage: number;
 }
-
 
 const assertMarketConstraints = (
   market: MarketConstraints,
@@ -40,7 +39,6 @@ const assertMarketConstraints = (
     throw new Error(`${CONSTRAINT_VIOLATION}:price must be a multiple of the tick size ${tickSize}`);
   }
 };
-
 
 const computeMarginRequirement = (
   positionSide: "LONG" | "SHORT" | "UNINITIALIZED",
@@ -113,6 +111,12 @@ export const createOrder = async (
     const userId = req.userId!;
     const { marketId, side, orderType, quantity, price, leverage } = parsed.data;
 
+    const action: EngineOrderAction = req.isInternalLiquidation
+      ? "MARKET-LIQUIDATE"
+      : orderType === "MARKET"
+        ? "MARKET-CREATE"
+        : "LIMIT-CREATE";
+
     const order = await prisma.$transaction(async (tx) => {
       const market = await tx.market.findUnique({
         where: { id: marketId },
@@ -135,9 +139,6 @@ export const createOrder = async (
 
       if (fillPrice !== undefined) {
 
-
-
-
         const position = await tx.position.findUnique({
           where: { userId_marketId: { userId, marketId } },
         });
@@ -159,9 +160,6 @@ export const createOrder = async (
         );
         if (gt(required, 0)) {
 
-
-
-
           const requiredMargin = toFixedString(required);
           const balance = await tx.balance.findUnique({ where: { userId } });
           if (!balance || !gte(balance.availableMargin.toString(), requiredMargin)) {
@@ -170,21 +168,20 @@ export const createOrder = async (
         }
       }
 
-
-
-      return tx.order.create({
+      const created = await tx.order.create({
         data: { userId, marketId, side, orderType, price: fillPrice, quantity, leverage },
       });
-    });
 
-    await addToQueue(
-      order,
-      req.isInternalLiquidation
-        ? "MARKET-LIQUIDATE"
-        : orderType === "MARKET"
-          ? "MARKET-CREATE"
-          : "LIMIT-CREATE",
-    );
+      await tx.commandOutbox.create({
+        data: {
+          commandId: `${created.id}__${action}`,
+          marketId: created.marketId,
+          type: action,
+          payload: toEngineOrder(created, action) as unknown as Prisma.InputJsonValue,
+        },
+      });
+      return created;
+    });
 
     res.status(201).json({ order: toOrderDTO(order) });
   } catch (error) {
@@ -221,7 +218,7 @@ export const cancelOrder = async (
       return;
     }
 
-    const { order, refundedMargin } = await prisma.$transaction(async (tx) => {
+    const { refundedMargin } = await prisma.$transaction(async (tx) => {
       const order = await tx.order.findFirst({ where: { id: orderId, userId } });
       if (!order) throw new Error(ORDER_NOT_FOUND);
 
@@ -234,6 +231,15 @@ export const cancelOrder = async (
         data: { status: "CANCELLED" },
       });
       if (updated.count === 0) throw new Error(NOT_CANCELLABLE);
+
+      await tx.commandOutbox.create({
+        data: {
+          commandId: `${order.id}__LIMIT-CANCEL`,
+          marketId: order.marketId,
+          type: "LIMIT-CANCEL",
+          payload: toEngineOrder(order, "LIMIT-CANCEL") as unknown as Prisma.InputJsonValue,
+        },
+      });
 
       if (order.price !== null) {
         const remaining = sub(
@@ -263,16 +269,10 @@ export const cancelOrder = async (
           )
         );
 
-
-
         return { order, refundedMargin: refund };
       }
       return { order, refundedMargin: "0" };
     });
-
-
-
-    await addToQueue(order, "LIMIT-CANCEL");
 
     res.status(200).json({ message: "Order cancelled", orderId, refundedMargin });
   } catch (error) {
