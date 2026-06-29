@@ -9,3 +9,16 @@ export function verifyToken(token: string): string | null {
     return null;
   }
 }
+
+export function verifyTicket(ticket: string): string | null {
+  try {
+    const decoded = jwt.verify(ticket, JWT_SECRET) as {
+      userId?: string;
+      ws?: boolean;
+    };
+    if (decoded.ws !== true || !decoded.userId) return null;
+    return decoded.userId;
+  } catch {
+    return null;
+  }
+}
