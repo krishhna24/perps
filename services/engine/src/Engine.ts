@@ -1,5 +1,5 @@
 import { RedisManager } from "@repo/pubsub";
-import { eventQueue, getCompletedCommands, Worker } from "@repo/queue";
+import { eventQueue, Worker } from "@repo/queue";
 import { prisma } from "@repo/db";
 import { Decimal } from "@repo/types";
 import { logger } from "@repo/logger";
@@ -23,17 +23,11 @@ import type {
 
 dotenv.config();
 
-
-const ENGINE_KEY = process.env["ENGINE_KEY"] ?? "production-snapshot.json";
+const ENGINE_KEY = process.env["ENGINE_KEY"] ?? "engine-snapshot.dev.json";
 
 const SNAPSHOT_INTERVAL_MS = 3000;
 
 const SNAPSHOT_WRITE_THRESHOLD = 200;
-
-
-
-
-
 
 export class Engine {
   public static instance: Engine | null = null;
@@ -43,20 +37,20 @@ export class Engine {
 
   private lastSeq = 0n;
 
-  private lastBalanceSeq = 0n;
-
   private lastFundingSeq = 0n;
 
   private snapshotTimer: ReturnType<typeof setInterval> | null = null;
+  private fundingWorker: Worker | null = null;
   private snapshotInFlight = false;
 
   private writesSinceSnapshot = 0;
 
   private replaying = false;
 
+  private writeChain: Promise<unknown> = Promise.resolve();
+
   private constructor() {
     this.orderbook = null;
-
 
   }
 
@@ -72,10 +66,6 @@ export class Engine {
 
     const engine = new Engine();
     try {
-
-
-
-
 
       const snapshot = await downloadSnapshot<EngineSnapshot>(ENGINE_KEY);
       if (snapshot) {
@@ -101,7 +91,6 @@ export class Engine {
     return engine;
   }
 
-
   loadSnapshot(snapshot: EngineSnapshot) {
     this.orderbook = new Orderbook(
       snapshot.orderbook.bids,
@@ -111,56 +100,37 @@ export class Engine {
     this.userBalance = deserializeBalances(snapshot.userBalance);
     this.userPosition = deserializePositions(snapshot.userPosition);
     this.lastSeq = snapshot.lastSeq ? BigInt(snapshot.lastSeq) : 0n;
-    this.lastBalanceSeq = snapshot.lastBalanceSeq ? BigInt(snapshot.lastBalanceSeq) : 0n;
     this.lastFundingSeq = snapshot.lastFundingSeq ? BigInt(snapshot.lastFundingSeq) : 0n;
   }
 
-
   async replayTail(): Promise<void> {
-    const commands = await getCompletedCommands();
-    if (commands.length === 0) return;
-
     const watermark = this.lastSeq;
+    const rows = await prisma.commandOutbox.findMany({
+      where: { seq: { gt: watermark } },
+      orderBy: { seq: "asc" },
+    });
+    if (rows.length === 0) return;
+
     this.replaying = true;
     try {
-      for (const command of commands) {
+      for (const row of rows) {
+        const command = { ...(row.payload as object), seq: row.seq.toString() };
         await this.dispatchCommand(command as Order | BalanceCommand);
       }
     } finally {
       this.replaying = false;
     }
 
-
-
-
-    const orderSeqs = commands
-      .filter((c) => {
-        const t = (c as { type?: string }).type;
-        return t !== "BALANCE-DEPOSIT" && t !== "BALANCE-WITHDRAW";
-      })
-      .map((c) => (c as { seq?: string }).seq)
-      .filter((s): s is string => s !== undefined)
-      .map((s) => BigInt(s));
-    const minOrderSeq = orderSeqs.length > 0 ? orderSeqs.reduce((a, b) => (a < b ? a : b)) : null;
-    if (minOrderSeq !== null && minOrderSeq > watermark + 1n) {
-      logger.warn(
-        `replay: oldest retained order seq ${minOrderSeq} > snapshot watermark ${watermark} + 1 — ` +
-          `commands in that gap may have been evicted (raise ORDER_QUEUE removeOnComplete or snapshot more often)`,
-      );
-    }
     logger.info(
-      `engine replayed ${commands.length} completed command(s); lastSeq ${watermark} → ${this.lastSeq}, ` +
-        `lastBalanceSeq=${this.lastBalanceSeq}`,
+      `engine replayed ${rows.length} outbox command(s); lastSeq ${watermark} → ${this.lastSeq}`,
     );
   }
-
 
   private startSnapshotLoop() {
     this.snapshotTimer = setInterval(() => {
       void this.saveSnapshot();
     }, SNAPSHOT_INTERVAL_MS);
   }
-
 
   async saveSnapshot(): Promise<void> {
     if (this.snapshotInFlight || !this.orderbook) return;
@@ -171,11 +141,9 @@ export class Engine {
         this.userBalance,
         this.userPosition,
         this.lastSeq,
-        this.lastBalanceSeq,
         this.lastFundingSeq,
       );
       await uploadSnapshot(snapshot, ENGINE_KEY);
-
 
       this.writesSinceSnapshot = 0;
     } catch (error) {
@@ -185,7 +153,6 @@ export class Engine {
     }
   }
 
-
   private noteWrite(): void {
     this.writesSinceSnapshot += 1;
     if (this.writesSinceSnapshot >= SNAPSHOT_WRITE_THRESHOLD) {
@@ -193,11 +160,14 @@ export class Engine {
     }
   }
 
-
   async stop(): Promise<void> {
     if (this.snapshotTimer) {
       clearInterval(this.snapshotTimer);
       this.snapshotTimer = null;
+    }
+    if (this.fundingWorker) {
+      await this.fundingWorker.close();
+      this.fundingWorker = null;
     }
     await this.saveSnapshot();
   }
@@ -206,42 +176,62 @@ export class Engine {
     if (!process.env["REDIS_HOST"] || !process.env["REDIS_PORT"]) {
       throw new Error("Missing REDIS_HOST or REDIS_PORT in env");
     }
-    new Worker(
+    this.fundingWorker = new Worker(
       "FUNDING_QUEUE",
-      (job) => {
+      async (job) => {
         if (job.data.fundingRate && job.data.markPrice) {
-          this.applyFunding(job.data.fundingRate, job.data.markPrice, job.data.settlementSeq);
+          await this.serialize(() =>
+            this.applyFunding(job.data.fundingRate, job.data.markPrice, job.data.settlementSeq),
+          );
         }
-        return Promise.resolve();
       },
       {
         connection: {
           host: process.env["REDIS_HOST"],
           port: Number(process.env["REDIS_PORT"]),
         },
+        concurrency: 1,
       },
     );
   }
 
+  serialize<T>(work: () => Promise<T> | T): Promise<T> {
+    const run = async (): Promise<T> => work();
+    const next = this.writeChain.then(run, run);
+    this.writeChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
 
   async dispatchCommand(data: Order | BalanceCommand): Promise<void> {
-    const type = (data as { type?: string }).type;
-    if (type === "BALANCE-DEPOSIT" || type === "BALANCE-WITHDRAW") {
-      await this.processBalanceCommand(data as BalanceCommand);
-    } else {
-      await this.processOrder(data as Order);
+    return this.serialize(() => {
+      const type = (data as { type?: string }).type;
+      if (type === "BALANCE-DEPOSIT" || type === "BALANCE-WITHDRAW") {
+        return this.processBalanceCommand(data as BalanceCommand);
+      }
+      return this.processOrder(data as Order);
+    });
+  }
+
+  private noteSkippedSeq(kind: string, seq: bigint): void {
+    if (seq < this.lastSeq) {
+      logger.error(
+        `out-of-order ${kind} DROPPED: seq=${seq} arrived after lastSeq=${this.lastSeq} — ` +
+          `a committed command has been lost`,
+      );
+      return;
     }
+    logger.debug(`skipping already-applied ${kind} seq=${seq} (lastSeq=${this.lastSeq})`);
   }
 
   async processOrder(order: Order): Promise<void> {
     logger.debug("engine processing order: ", order);
 
-
-
-
     const seq = order.seq !== undefined ? BigInt(order.seq) : null;
     if (seq !== null && seq <= this.lastSeq) {
-      logger.debug(`skipping already-applied order seq=${seq} (lastSeq=${this.lastSeq})`);
+      this.noteSkippedSeq("order", seq);
       return;
     }
 
@@ -262,27 +252,14 @@ export class Engine {
         }
         break;
       case "LIMIT-CANCEL": {
-        this.orderbook?.cancelOrder(order.id!, order.userId);
-
-        const remainingQuantity = order.quantity - order.filled;
-        const userBalance = this.userBalance.get(order.userId);
-        const userPosition = this.userPosition.get(order.userId);
-
-        logger.debug("remaining quantity", remainingQuantity);
-        logger.debug("user balance", userBalance);
-
-        if (userBalance) {
-          const refund = this.computeMarginRequirement(
-            userPosition,
-            order.entryPrice,
-            remainingQuantity,
-            order.leverage,
-            order.side,
-          );
-          userBalance.availableBalance = userBalance.availableBalance.plus(refund);
-          userBalance.lockedBalance = userBalance.lockedBalance.minus(refund);
+        const removed = this.orderbook?.cancelOrder(order.id!, order.userId) ?? null;
+        if (!removed) {
+          logger.debug(`cancel ignored — order ${order.id} is not resting in the book`);
+          break;
         }
-        logger.debug("cancelling order", order);
+        logger.debug("cancelling order", removed);
+
+        this.reconcileLocked(order.userId);
 
         this.publishUserBalance(order.userId);
         this.publishOrderCancelled(order.id!);
@@ -312,22 +289,16 @@ export class Engine {
     this.updateTopOfBook();
     this.positionUpdateForLiquidation();
 
-
-
-
     if (seq !== null && seq > this.lastSeq) this.lastSeq = seq;
     this.noteWrite();
   }
-
 
   async processBalanceCommand(command: BalanceCommand): Promise<void> {
     logger.debug("engine processing balance command: ", command);
 
     const seq = command.seq !== undefined ? BigInt(command.seq) : null;
-    if (seq !== null && seq <= this.lastBalanceSeq) {
-      logger.debug(
-        `skipping already-applied balance command seq=${seq} (lastBalanceSeq=${this.lastBalanceSeq})`,
-      );
+    if (seq !== null && seq <= this.lastSeq) {
+      this.noteSkippedSeq("balance command", seq);
       return;
     }
 
@@ -339,7 +310,7 @@ export class Engine {
       if (balance.availableBalance.lessThan(amount)) {
         this.publishBalanceRejected(command, "Insufficient Balance");
         this.updateRedisLedger(command.id, "REJECTED");
-        if (seq !== null && seq > this.lastBalanceSeq) this.lastBalanceSeq = seq;
+        if (seq !== null && seq > this.lastSeq) this.lastSeq = seq;
         return;
       }
       balance.availableBalance = balance.availableBalance.minus(amount);
@@ -351,21 +322,20 @@ export class Engine {
     this.updateRedisBalance(command.userId);
     this.updateRedisLedger(command.id, "APPLIED");
 
-    if (seq !== null && seq > this.lastBalanceSeq) this.lastBalanceSeq = seq;
+    if (seq !== null && seq > this.lastSeq) this.lastSeq = seq;
     this.noteWrite();
   }
 
   async createOrder(
     id: string,
     userId: string,
-    entryPrice: number,
-    quantity: number,
+    entryPrice: string,
+    quantity: string,
     side: OrderSide,
     leverage: number,
   ) {
     logger.debug("create order entered");
     await this.ensureUser(userId);
-    this.checkAndLockBalance(userId, entryPrice, quantity, leverage, side);
 
     const order: Order = {
       id,
@@ -374,10 +344,12 @@ export class Engine {
       entryPrice,
       quantity,
       leverage,
-      filled: 0,
+      filled: "0",
     };
+    this.assertCanAfford(userId, order);
+
     const { executedQty, fills, updatedOrders } = this.orderbook?.addOrder(order) ?? {
-      executedQty: 0,
+      executedQty: new Decimal(0),
       fills: [],
       updatedOrders: [],
     };
@@ -388,7 +360,7 @@ export class Engine {
     this.publishLastTrade(fills);
     this.publishDepth();
     this.updateRedisDepth();
-    this.updateRedisOrder({ ...order, filled: executedQty });
+    this.updateRedisOrder({ ...order, filled: executedQty.toString() });
     for (const makerOrder of updatedOrders) {
       this.updateRedisOrder(makerOrder);
     }
@@ -397,24 +369,15 @@ export class Engine {
     logger.debug(executedQty, fills);
   }
 
-  async createMarketOrder(id: string, userId: string, quantity: number, side: OrderSide, leverage: number) {
+  async createMarketOrder(id: string, userId: string, quantity: string, side: OrderSide, leverage: number) {
     logger.debug("create order entered");
     await this.ensureUser(userId);
 
     const referencePrice = this.orderbook?.getBestOppositePrice(side, quantity);
     if (!referencePrice) {
 
-
       throw new Error("No reference price found");
     }
-
-
-
-    const prePos = this.userPosition.get(userId);
-    const preSnapshot: UserPosition | undefined = prePos
-      ? { ...prePos, side: prePos.side, quantity: prePos.quantity }
-      : undefined;
-    this.checkAndLockBalance(userId, referencePrice, quantity, leverage, side);
 
     const order: Order = {
       id,
@@ -423,30 +386,15 @@ export class Engine {
       entryPrice: referencePrice,
       quantity,
       leverage,
-      filled: 0,
+      filled: "0",
     };
-
+    this.assertCanAfford(userId, order);
 
     const { executedQty, fills, updatedOrders } = this.orderbook?.addOrder(order, false) ?? {
-      executedQty: 0,
+      executedQty: new Decimal(0),
       fills: [],
       updatedOrders: [],
     };
-
-
-
-
-
-    if (executedQty < quantity) {
-      const lockedFull = this.computeMarginRequirement(preSnapshot, referencePrice, quantity, leverage, side);
-      const lockedFilled = this.computeMarginRequirement(preSnapshot, referencePrice, executedQty, leverage, side);
-      const refund = lockedFull.minus(lockedFilled);
-      const balance = this.userBalance.get(userId);
-      if (balance && refund.greaterThan(0)) {
-        balance.availableBalance = balance.availableBalance.plus(refund);
-        balance.lockedBalance = balance.lockedBalance.minus(refund);
-      }
-    }
 
     this.updateUserPnl(fills, executedQty, order);
     this.updateUserPosition(fills, executedQty, order);
@@ -454,7 +402,7 @@ export class Engine {
     this.publishLastTrade(fills);
     this.publishDepth();
     this.updateRedisDepth();
-    this.updateRedisOrder({ ...order, filled: executedQty });
+    this.updateRedisOrder({ ...order, filled: executedQty.toString() });
     for (const makerOrder of updatedOrders) {
       this.updateRedisOrder(makerOrder);
     }
@@ -485,47 +433,79 @@ export class Engine {
     }
   }
 
-
-  computeMarginRequirement(
-    userPosition: UserPosition | undefined,
-    price: number,
-    quantity: number,
-    leverage: number,
-    side: OrderSide,
-  ): Decimal {
-    const isOpposite =
-      (side === "LONG" && userPosition?.side === "SHORT") ||
-      (side === "SHORT" && userPosition?.side === "LONG");
-
-    if (isOpposite && userPosition) {
-      if (userPosition.quantity.gte(quantity)) return new Decimal(0);
-      const excess = new Decimal(quantity).minus(userPosition.quantity);
-      return new Decimal(price).times(excess).div(leverage);
+  private orderMargin(
+    order: Order,
+    offsetAvailable: Decimal,
+  ): { margin: Decimal; offsetUsed: Decimal } {
+    const remaining = new Decimal(order.quantity).minus(order.filled);
+    if (remaining.lessThanOrEqualTo(0)) {
+      return { margin: new Decimal(0), offsetUsed: new Decimal(0) };
     }
-
-    return new Decimal(price).times(quantity).div(leverage);
+    const offsetUsed = Decimal.min(remaining, offsetAvailable);
+    const opening = remaining.minus(offsetUsed);
+    return {
+      margin: new Decimal(order.entryPrice).times(opening).div(order.leverage),
+      offsetUsed,
+    };
   }
 
-  checkAndLockBalance(
-    userId: string,
-    price: number,
-    quantity: number,
-    leverage: number,
-    side: OrderSide,
-  ) {
-    const userPosition = this.userPosition.get(userId);
+  requiredLock(userId: string, extraOrder?: Order): Decimal {
+    const position = this.userPosition.get(userId);
+    let total = position ? position.margin : new Decimal(0);
+
+    let offsetLong = position?.side === "LONG" ? position.quantity : new Decimal(0);
+    let offsetShort = position?.side === "SHORT" ? position.quantity : new Decimal(0);
+
+    const resting = this.orderbook?.getOpenOrders(userId) ?? [];
+    const orders = extraOrder ? [...resting, extraOrder] : resting;
+
+    for (const order of orders) {
+      if (order.side === "LONG") {
+        const { margin, offsetUsed } = this.orderMargin(order, offsetShort);
+        offsetShort = offsetShort.minus(offsetUsed);
+        total = total.plus(margin);
+      } else {
+        const { margin, offsetUsed } = this.orderMargin(order, offsetLong);
+        offsetLong = offsetLong.minus(offsetUsed);
+        total = total.plus(margin);
+      }
+    }
+    return total;
+  }
+
+  reconcileLocked(userId: string): void {
+    const balance = this.userBalance.get(userId);
+    if (!balance) return;
+
+    const required = this.requiredLock(userId);
+    const delta = balance.lockedBalance.minus(required);
+    if (delta.isZero()) return;
+
+    balance.lockedBalance = required;
+    balance.availableBalance = balance.availableBalance.plus(delta);
+
+    if (balance.availableBalance.isNegative()) {
+      logger.error(
+        `margin invariant violated for ${userId}: available ${balance.availableBalance.toFixed(8)} ` +
+          `after locking ${required.toFixed(8)} — position or fill exceeded posted collateral`,
+      );
+    }
+  }
+
+  assertCanAfford(userId: string, order: Order): void {
     const balance = this.userBalance.get(userId)!;
-
-    const marginRequired = this.computeMarginRequirement(userPosition, price, quantity, leverage, side);
-    if (marginRequired.isZero()) return;
-
-    if (balance.availableBalance.lessThan(marginRequired)) {
+    const required = this.requiredLock(userId, order);
+    const collateral = balance.availableBalance.plus(balance.lockedBalance);
+    if (collateral.lessThan(required)) {
       throw new Error("Insufficient Balance");
     }
-    balance.availableBalance = balance.availableBalance.minus(marginRequired);
-    balance.lockedBalance = balance.lockedBalance.plus(marginRequired);
   }
 
+  private releaseMargin(position: UserPosition, closingQty: Decimal): Decimal {
+    if (position.quantity.lessThanOrEqualTo(0)) return new Decimal(0);
+    if (closingQty.greaterThanOrEqualTo(position.quantity)) return position.margin;
+    return position.margin.times(closingQty).div(position.quantity);
+  }
 
   private realizedPnl(
     fills: Fill[],
@@ -546,7 +526,6 @@ export class Engine {
     return pnl;
   }
 
-
   private openingNotional(fills: Fill[], skipQty: Decimal): Decimal {
     let remaining = skipQty;
     let notional = new Decimal(0);
@@ -562,19 +541,7 @@ export class Engine {
     return notional;
   }
 
-
-  private refundFillImprovement(order: Order, openQty: Decimal, openNotional: Decimal): void {
-    if (openQty.lessThanOrEqualTo(0)) return;
-    const lockedNotional = new Decimal(order.entryPrice).times(openQty);
-    const refund = lockedNotional.minus(openNotional).div(order.leverage);
-    if (refund.isZero()) return;
-    const balance = this.userBalance.get(order.userId);
-    if (!balance) return;
-    balance.availableBalance = balance.availableBalance.plus(refund);
-    balance.lockedBalance = balance.lockedBalance.minus(refund);
-  }
-
-  updateUserPnl(fills: Fill[], executedQty: number, order: Order) {
+  updateUserPnl(fills: Fill[], executedQty: Decimal, order: Order) {
     const userPosition = this.userPosition.get(order.userId);
     const userBalance = this.userBalance.get(order.userId)!;
     if (fills.length === 0 || !userPosition) return;
@@ -582,28 +549,21 @@ export class Engine {
     const userSide = userPosition.side;
     const orderSide = order.side;
 
-
-
     const closingQty = Decimal.min(userPosition.quantity, executedQty);
-
-
-    const positionLeverage = userPosition.leverage ?? order.leverage;
-    const releasedMargin = userPosition.entryPrice.div(positionLeverage).times(closingQty);
+    if (closingQty.lessThanOrEqualTo(0)) return;
 
     if (userSide === "LONG" && orderSide === "SHORT") {
       const pnl = this.realizedPnl(fills, userPosition.entryPrice, closingQty, "LONG");
-      userBalance.availableBalance = userBalance.availableBalance.plus(releasedMargin).plus(pnl);
-      userBalance.lockedBalance = userBalance.lockedBalance.minus(releasedMargin);
+      userBalance.availableBalance = userBalance.availableBalance.plus(pnl);
     }
 
     if (userSide === "SHORT" && orderSide === "LONG") {
       const pnl = this.realizedPnl(fills, userPosition.entryPrice, closingQty, "SHORT");
-      userBalance.availableBalance = userBalance.availableBalance.plus(releasedMargin).plus(pnl);
-      userBalance.lockedBalance = userBalance.lockedBalance.minus(releasedMargin);
+      userBalance.availableBalance = userBalance.availableBalance.plus(pnl);
     }
   }
 
-  updateUserPosition(fills: Fill[], executedQty: number, order: Order) {
+  updateUserPosition(fills: Fill[], executedQty: Decimal, order: Order) {
     const userPosition = this.userPosition.get(order.userId);
     const exec = new Decimal(executedQty);
     switch (userPosition?.side) {
@@ -619,16 +579,9 @@ export class Engine {
 
           userPosition.margin = userPosition.margin.plus(newNotional.div(order.leverage));
           userPosition.leverage = order.leverage;
-          this.refundFillImprovement(order, exec, newNotional);
         } else {
 
-
-
-
           if (userPosition.quantity.lessThan(exec)) {
-
-
-
 
             const remainingQty = exec.minus(userPosition.quantity);
             const openNotional = this.openingNotional(fills, userPosition.quantity);
@@ -637,16 +590,10 @@ export class Engine {
             userPosition.margin = openNotional.div(order.leverage);
             userPosition.entryPrice = openNotional.div(remainingQty);
             userPosition.leverage = order.leverage;
-            this.refundFillImprovement(order, remainingQty, openNotional);
           } else if (userPosition.quantity.greaterThan(exec)) {
-
-
+            const released = this.releaseMargin(userPosition, exec);
             userPosition.quantity = userPosition.quantity.minus(exec);
-
-
-
-            const newMargin = userPosition.entryPrice.times(exec).div(userPosition.leverage ?? order.leverage);
-            userPosition.margin = userPosition.margin.minus(newMargin);
+            userPosition.margin = userPosition.margin.minus(released);
           } else {
             userPosition.side = "UNINITIALIZED";
             userPosition.quantity = new Decimal(0);
@@ -667,13 +614,9 @@ export class Engine {
 
           userPosition.margin = userPosition.margin.plus(newNotional.div(order.leverage));
           userPosition.leverage = order.leverage;
-          this.refundFillImprovement(order, exec, newNotional);
         } else {
 
-
           if (userPosition.quantity.lessThan(exec)) {
-
-
 
             const remainingQty = exec.minus(userPosition.quantity);
             const openNotional = this.openingNotional(fills, userPosition.quantity);
@@ -682,16 +625,10 @@ export class Engine {
             userPosition.margin = openNotional.div(order.leverage);
             userPosition.entryPrice = openNotional.div(remainingQty);
             userPosition.leverage = order.leverage;
-            this.refundFillImprovement(order, remainingQty, openNotional);
           } else if (userPosition.quantity.greaterThan(exec)) {
-
-
+            const released = this.releaseMargin(userPosition, exec);
             userPosition.quantity = userPosition.quantity.minus(exec);
-
-
-
-            const newMargin = userPosition.entryPrice.times(exec).div(userPosition.leverage ?? order.leverage);
-            userPosition.margin = userPosition.margin.minus(newMargin);
+            userPosition.margin = userPosition.margin.minus(released);
           } else {
             userPosition.side = "UNINITIALIZED";
             userPosition.quantity = new Decimal(0);
@@ -701,17 +638,15 @@ export class Engine {
         }
         break;
       default:
-        if (executedQty && userPosition) {
+        if (executedQty.greaterThan(0) && userPosition) {
 
           const openNotional = this.openingNotional(fills, new Decimal(0));
           userPosition.side = order.side;
           userPosition.entryPrice = openNotional.div(exec);
           userPosition.quantity = exec;
 
-
           userPosition.margin = openNotional.div(order.leverage);
           userPosition.leverage = order.leverage;
-          this.refundFillImprovement(order, exec, openNotional);
         }
         break;
     }
@@ -738,22 +673,17 @@ export class Engine {
           } else {
             if (makerPosition.quantity.greaterThan(fillQty)) {
 
-
-              const newMargin = makerPosition.entryPrice
-                .times(fillQty)
-                .div(makerPosition.leverage ?? fill.otherLeverage);
+              const released = this.releaseMargin(makerPosition, fillQty);
               const pnl = fillPrice.minus(makerPosition.entryPrice).times(fillQty);
               if (makerBalance) {
-                makerBalance.availableBalance = makerBalance.availableBalance.plus(newMargin).plus(pnl);
-                makerBalance.lockedBalance = makerBalance.lockedBalance.minus(newMargin);
+                makerBalance.availableBalance = makerBalance.availableBalance.plus(pnl);
               }
               makerPosition.quantity = makerPosition.quantity.minus(fillQty);
-              makerPosition.margin = makerPosition.margin.minus(newMargin);
+              makerPosition.margin = makerPosition.margin.minus(released);
             } else if (makerPosition.quantity.equals(fillQty)) {
               const pnl = fillPrice.minus(makerPosition.entryPrice).times(fillQty);
               if (makerBalance) {
-                makerBalance.availableBalance = makerBalance.availableBalance.plus(makerPosition.margin).plus(pnl);
-                makerBalance.lockedBalance = makerBalance.lockedBalance.minus(makerPosition.margin);
+                makerBalance.availableBalance = makerBalance.availableBalance.plus(pnl);
               }
               makerPosition.side = "UNINITIALIZED";
               makerPosition.quantity = new Decimal(0);
@@ -761,13 +691,10 @@ export class Engine {
               makerPosition.entryPrice = new Decimal(0);
             } else {
 
-
-
               const closedQty = makerPosition.quantity;
               const pnl = fillPrice.minus(makerPosition.entryPrice).times(closedQty);
               if (makerBalance) {
-                makerBalance.availableBalance = makerBalance.availableBalance.plus(makerPosition.margin).plus(pnl);
-                makerBalance.lockedBalance = makerBalance.lockedBalance.minus(makerPosition.margin);
+                makerBalance.availableBalance = makerBalance.availableBalance.plus(pnl);
               }
               const remainingQty = fillQty.minus(closedQty);
               makerPosition.side = "SHORT";
@@ -793,22 +720,17 @@ export class Engine {
           } else {
             if (makerPosition.quantity.greaterThan(fillQty)) {
 
-
-              const newMargin = makerPosition.entryPrice
-                .times(fillQty)
-                .div(makerPosition.leverage ?? fill.otherLeverage);
+              const released = this.releaseMargin(makerPosition, fillQty);
               const pnl = makerPosition.entryPrice.minus(fillPrice).times(fillQty);
               if (makerBalance) {
-                makerBalance.availableBalance = makerBalance.availableBalance.plus(newMargin).plus(pnl);
-                makerBalance.lockedBalance = makerBalance.lockedBalance.minus(newMargin);
+                makerBalance.availableBalance = makerBalance.availableBalance.plus(pnl);
               }
               makerPosition.quantity = makerPosition.quantity.minus(fillQty);
-              makerPosition.margin = makerPosition.margin.minus(newMargin);
+              makerPosition.margin = makerPosition.margin.minus(released);
             } else if (makerPosition.quantity.equals(fillQty)) {
               const pnl = makerPosition.entryPrice.minus(fillPrice).times(fillQty);
               if (makerBalance) {
-                makerBalance.availableBalance = makerBalance.availableBalance.plus(makerPosition.margin).plus(pnl);
-                makerBalance.lockedBalance = makerBalance.lockedBalance.minus(makerPosition.margin);
+                makerBalance.availableBalance = makerBalance.availableBalance.plus(pnl);
               }
               makerPosition.side = "UNINITIALIZED";
               makerPosition.quantity = new Decimal(0);
@@ -816,13 +738,10 @@ export class Engine {
               makerPosition.entryPrice = new Decimal(0);
             } else {
 
-
-
               const closedQty = makerPosition.quantity;
               const pnl = makerPosition.entryPrice.minus(fillPrice).times(closedQty);
               if (makerBalance) {
-                makerBalance.availableBalance = makerBalance.availableBalance.plus(makerPosition.margin).plus(pnl);
-                makerBalance.lockedBalance = makerBalance.lockedBalance.minus(makerPosition.margin);
+                makerBalance.availableBalance = makerBalance.availableBalance.plus(pnl);
               }
               const remainingQty = fillQty.minus(closedQty);
               makerPosition.side = "LONG";
@@ -846,16 +765,15 @@ export class Engine {
     });
   }
 
-
   private publishAndPersistBalances(takerId: string, fills: Fill[]) {
     const affected = new Set<string>([takerId]);
     for (const fill of fills) affected.add(fill.otherUserId);
     for (const userId of affected) {
+      this.reconcileLocked(userId);
       this.publishUserBalance(userId);
       this.updateRedisBalance(userId);
     }
   }
-
 
   private serializePosition(userId: string, p: UserPosition) {
     return {
@@ -871,12 +789,10 @@ export class Engine {
     };
   }
 
-
   private publish(channel: string, message: unknown): void {
     if (this.replaying) return;
     RedisManager.getInstance().publishToChannel(channel, message);
   }
-
 
   private emitEvent(name: string, data: unknown): void {
     if (this.replaying) return;
@@ -897,10 +813,11 @@ export class Engine {
 
   publishLastTrade(fills: Fill[]) {
     const lastFill = fills[fills.length - 1];
+    if (!lastFill) return;
     this.publish(`trade:update`, {
       data: {
-        p: lastFill?.price,
-        q: lastFill?.quantity,
+        p: lastFill.price,
+        q: lastFill.quantity,
       },
     });
   }
@@ -921,9 +838,6 @@ export class Engine {
     const balance = this.userBalance.get(userId);
     if (!balance) return;
 
-
-
-
     this.emitEvent("update_balance", {
       type: "BALANCE_UPDATE",
       data: {
@@ -933,7 +847,6 @@ export class Engine {
       },
     });
   }
-
 
   updateRedisLedger(ledgerId: string, status: "APPLIED" | "REJECTED") {
     this.emitEvent("update_ledger", {
@@ -1016,9 +929,6 @@ export class Engine {
 
   applyFunding(fundingRate: string, markPrice: string, settlementSeq?: string) {
 
-
-
-
     const seq = settlementSeq !== undefined ? BigInt(settlementSeq) : null;
     if (seq !== null && seq <= this.lastFundingSeq) {
       logger.debug(`skipping already-applied funding settlement seq=${seq} (last=${this.lastFundingSeq})`);
@@ -1027,50 +937,70 @@ export class Engine {
 
     const rate = new Decimal(fundingRate);
     const mark = new Decimal(markPrice);
-    const affected: string[] = [];
+
+    const payers: { userId: string; amount: Decimal }[] = [];
+    const receivers: { userId: string; amount: Decimal }[] = [];
+
     for (const [userId, position] of this.userPosition.entries()) {
-      const side = position.side;
-      if (side === "UNINITIALIZED") continue;
-      const fundingPayment = mark.times(position.quantity).times(rate);
+      if (position.side === "UNINITIALIZED") continue;
+      if (position.quantity.lessThanOrEqualTo(0)) continue;
+      if (!this.userBalance.has(userId)) continue;
 
+      const payment = mark.times(position.quantity).times(rate);
+      if (payment.isZero()) continue;
 
+      const isLong = position.side === "LONG";
+      const pays = payment.isPositive() ? isLong : !isLong;
+      (pays ? payers : receivers).push({ userId, amount: payment.abs() });
+    }
 
+    const totalClaim = receivers.reduce((sum, r) => sum.plus(r.amount), new Decimal(0));
 
+    if (payers.length === 0 || totalClaim.lessThanOrEqualTo(0)) {
+      if (seq !== null) this.lastFundingSeq = seq;
+      return;
+    }
 
+    const affected = new Set<string>();
 
-
-      if (side === "LONG") {
-        const next = position.margin.minus(fundingPayment);
-        if (next.isNegative()) {
-          logger.warn(
-            `funding shortfall for ${userId}: payment ${fundingPayment.toFixed(8)} exceeds margin ${position.margin.toFixed(8)} (bad debt ${next.negated().toFixed(8)})`,
-          );
-          position.margin = new Decimal(0);
-        } else {
-          position.margin = next;
-        }
-      } else {
-        position.margin = position.margin.plus(fundingPayment);
+    let collected = new Decimal(0);
+    for (const { userId, amount } of payers) {
+      const balance = this.userBalance.get(userId)!;
+      const capacity = Decimal.max(balance.availableBalance, new Decimal(0));
+      const payable = Decimal.min(amount, capacity);
+      if (payable.lessThan(amount)) {
+        logger.warn(
+          `funding shortfall for ${userId}: owed ${amount.toFixed(8)}, paid ${payable.toFixed(8)} ` +
+            `(bad debt ${amount.minus(payable).toFixed(8)})`,
+        );
       }
-      affected.push(userId);
+      if (payable.lessThanOrEqualTo(0)) continue;
+      balance.availableBalance = balance.availableBalance.minus(payable);
+      collected = collected.plus(payable);
+      affected.add(userId);
+    }
+
+    if (collected.greaterThan(0)) {
+      const ordered = [...receivers].sort((a, b) => b.amount.comparedTo(a.amount));
+      let distributed = new Decimal(0);
+      ordered.forEach((receiver, index) => {
+        const balance = this.userBalance.get(receiver.userId)!;
+        const share =
+          index === ordered.length - 1
+            ? collected.minus(distributed)
+            : collected.times(receiver.amount).div(totalClaim);
+        if (share.lessThanOrEqualTo(0)) return;
+        balance.availableBalance = balance.availableBalance.plus(share);
+        distributed = distributed.plus(share);
+        affected.add(receiver.userId);
+      });
     }
 
     if (seq !== null) this.lastFundingSeq = seq;
 
-
-
-
     for (const userId of affected) {
-      const position = this.userPosition.get(userId);
-      if (position) {
-        this.emitEvent("update_position", {
-          type: "POSITION_UPDATE",
-          data: this.serializePosition(userId, position),
-        });
-      }
-    }
-    if (affected.length > 0) {
-      this.positionUpdateForLiquidation();
+      this.publishUserBalance(userId);
+      this.updateRedisBalance(userId);
     }
   }
 
@@ -1092,17 +1022,21 @@ export class Engine {
   }
 
   publishOrderRejected(order: Order, error: unknown) {
-
-
+    const reason = error instanceof Error ? error.message : String(error);
     this.publish(`order:rejected@${order.userId}`, {
       data: {
         userId: order.userId,
         orderId: order.id,
-        reason: error instanceof Error ? error.message : String(error),
+        reason,
       },
     });
+    if (order.id) {
+      this.emitEvent("reject_order", {
+        type: "ORDER_REJECTED",
+        data: { orderId: order.id, reason },
+      });
+    }
   }
-
 
   publishBalanceRejected(command: BalanceCommand, reason: string) {
     this.publish(`order:rejected@${command.userId}`, {

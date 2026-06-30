@@ -11,6 +11,8 @@ import type {
   OrderbookSnapshot,
 } from "./types.js";
 
+const d = (v: string): Decimal => new Decimal(v);
+
 export class Orderbook {
   constructor(
     public bids: Order[] = [],
@@ -33,23 +35,22 @@ export class Orderbook {
   }
 
   private sortOrders() {
-    this.bids.sort((a, b) => b.entryPrice - a.entryPrice);
-    this.asks.sort((a, b) => a.entryPrice - b.entryPrice);
+    this.bids.sort((a, b) => d(b.entryPrice).comparedTo(d(a.entryPrice)));
+    this.asks.sort((a, b) => d(a.entryPrice).comparedTo(d(b.entryPrice)));
   }
-
 
   addOrder(order: Order, allowResting = true): MatchResult {
     if (order.side === "LONG") {
       const { executedQty, fills, updatedOrders } = this.matchBid(order);
-      if (allowResting && executedQty < order.quantity) {
-        this.bids.push({ ...order, filled: executedQty });
+      if (allowResting && executedQty.lessThan(order.quantity)) {
+        this.bids.push({ ...order, filled: executedQty.toString() });
         this.sortOrders();
       }
       return { executedQty, fills, updatedOrders };
     } else {
       const { executedQty, fills, updatedOrders } = this.matchAsk(order);
-      if (allowResting && executedQty < order.quantity) {
-        this.asks.push({ ...order, filled: executedQty });
+      if (allowResting && executedQty.lessThan(order.quantity)) {
+        this.asks.push({ ...order, filled: executedQty.toString() });
         this.sortOrders();
       }
       return { executedQty, fills, updatedOrders };
@@ -57,24 +58,22 @@ export class Orderbook {
   }
 
   matchAsk(order: Order): MatchResult {
-    let executedQty = 0;
+    let executedQty = new Decimal(0);
     const fills: Fill[] = [];
     const updatedOrders: Order[] = [];
+    const orderQty = d(order.quantity);
+    const orderPrice = d(order.entryPrice);
 
     for (const bid of this.bids) {
-      if (executedQty >= order.quantity) break;
-      if (order.entryPrice > bid.entryPrice) continue;
+      if (executedQty.greaterThanOrEqualTo(orderQty)) break;
+      if (orderPrice.greaterThan(d(bid.entryPrice))) break;
       if (order.userId === bid.userId) continue;
 
-
-
-
-
-      const remaining = bid.quantity - bid.filled;
-      if (remaining <= 0) continue;
-      const traded = Math.min(remaining, order.quantity - executedQty);
-      executedQty += traded;
-      bid.filled += traded;
+      const remaining = d(bid.quantity).minus(bid.filled);
+      if (remaining.lessThanOrEqualTo(0)) continue;
+      const traded = Decimal.min(remaining, orderQty.minus(executedQty));
+      executedQty = executedQty.plus(traded);
+      bid.filled = d(bid.filled).plus(traded).toString();
       updatedOrders.push(bid);
 
       fills.push({
@@ -84,32 +83,31 @@ export class Orderbook {
         otherUserId: bid.userId,
         otherOrderId: bid.id!,
         price: bid.entryPrice,
-        quantity: traded,
+        quantity: traded.toString(),
         otherLeverage: bid.leverage,
       });
     }
-    this.bids = this.bids.filter((bid) => bid.filled < bid.quantity);
+    this.bids = this.bids.filter((bid) => d(bid.filled).lessThan(bid.quantity));
     return { executedQty, fills, updatedOrders };
   }
 
   matchBid(order: Order): MatchResult {
-    let executedQty = 0;
+    let executedQty = new Decimal(0);
     const fills: Fill[] = [];
     const updatedOrders: Order[] = [];
+    const orderQty = d(order.quantity);
+    const orderPrice = d(order.entryPrice);
 
     for (const ask of this.asks) {
-      if (executedQty >= order.quantity) break;
-      if (order.entryPrice < ask.entryPrice) continue;
+      if (executedQty.greaterThanOrEqualTo(orderQty)) break;
+      if (orderPrice.lessThan(d(ask.entryPrice))) break;
       if (order.userId === ask.userId) continue;
 
-
-
-
-      const remaining = ask.quantity - ask.filled;
-      if (remaining <= 0) continue;
-      const traded = Math.min(remaining, order.quantity - executedQty);
-      executedQty += traded;
-      ask.filled += traded;
+      const remaining = d(ask.quantity).minus(ask.filled);
+      if (remaining.lessThanOrEqualTo(0)) continue;
+      const traded = Decimal.min(remaining, orderQty.minus(executedQty));
+      executedQty = executedQty.plus(traded);
+      ask.filled = d(ask.filled).plus(traded).toString();
       updatedOrders.push(ask);
 
       fills.push({
@@ -119,11 +117,11 @@ export class Orderbook {
         otherUserId: ask.userId,
         otherOrderId: ask.id!,
         price: ask.entryPrice,
-        quantity: traded,
+        quantity: traded.toString(),
         otherLeverage: ask.leverage,
       });
     }
-    this.asks = this.asks.filter((ask) => ask.filled < ask.quantity);
+    this.asks = this.asks.filter((ask) => d(ask.filled).lessThan(ask.quantity));
     return { executedQty, fills, updatedOrders };
   }
 
@@ -135,24 +133,19 @@ export class Orderbook {
   }
 
   private aggregateByPrice(orders: Order[], descending = true): DepthLevel[] {
-    const priceMap = new Map<number, number>();
+    const priceMap = new Map<string, Decimal>();
 
     orders.forEach((order) => {
-
-
-
-      const remaining = order.quantity - order.filled;
-      if (remaining > 0) {
-        priceMap.set(order.entryPrice, (priceMap.get(order.entryPrice) ?? 0) + remaining);
+      const remaining = d(order.quantity).minus(order.filled);
+      if (remaining.greaterThan(0)) {
+        priceMap.set(order.entryPrice, (priceMap.get(order.entryPrice) ?? new Decimal(0)).plus(remaining));
       }
     });
 
     const entries: DepthLevel[] = Array.from(priceMap.entries()).map(([price, quantity]) => [
-      price.toString(),
+      price,
       quantity.toString(),
     ]);
-
-
 
     return descending
       ? entries.sort((a, b) => new Decimal(b[0]).comparedTo(a[0]))
@@ -166,31 +159,33 @@ export class Orderbook {
     return [...userAsks, ...userBids];
   }
 
-  cancelOrder(orderId: string, userId: string): void {
+  cancelOrder(orderId: string, userId: string): Order | null {
     const bidIndex = this.bids.findIndex((bid) => bid.userId === userId && bid.id === orderId);
     if (bidIndex !== -1) {
-      this.bids.splice(bidIndex, 1);
+      const [removed] = this.bids.splice(bidIndex, 1);
       logger.debug("order cancelled");
+      return removed ?? null;
     }
     const askIndex = this.asks.findIndex((ask) => ask.userId === userId && ask.id === orderId);
     if (askIndex !== -1) {
-      this.asks.splice(askIndex, 1);
+      const [removed] = this.asks.splice(askIndex, 1);
       logger.debug("order cancelled");
+      return removed ?? null;
     }
+    return null;
   }
 
-
-  getBestOppositePrice(side: OrderSide, quantity: number): number | undefined {
+  getBestOppositePrice(side: OrderSide, quantity: string): string | undefined {
     const levels = side === "LONG" ? this.asks : this.bids;
-    let bestPrice: number | undefined;
-    let fillQuantity = 0;
+    const target = d(quantity);
+    let bestPrice: string | undefined;
+    let fillQuantity = new Decimal(0);
     for (const level of levels) {
-
-      const remaining = level.quantity - level.filled;
-      if (remaining <= 0) continue;
+      const remaining = d(level.quantity).minus(level.filled);
+      if (remaining.lessThanOrEqualTo(0)) continue;
       bestPrice = level.entryPrice;
-      fillQuantity += remaining;
-      if (fillQuantity >= quantity) break;
+      fillQuantity = fillQuantity.plus(remaining);
+      if (fillQuantity.greaterThanOrEqualTo(target)) break;
     }
     return bestPrice;
   }

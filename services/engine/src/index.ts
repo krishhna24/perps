@@ -19,18 +19,12 @@ async function main(): Promise<void> {
   const worker = new Worker(
     QUEUE_NAME,
     async (job) => {
-
-
-
-
       await engine.dispatchCommand(job.data as Order | BalanceCommand);
     },
-    { connection },
+    { connection, concurrency: 1 },
   );
 
   console.log(`engine up — consuming ${QUEUE_NAME}`);
-
-
 
   const shutdown = async (signal: string): Promise<void> => {
     console.log(`${signal} received — draining engine`);

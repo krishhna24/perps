@@ -31,8 +31,6 @@ export interface EngineSnapshot {
 
   lastSeq: string;
 
-  lastBalanceSeq?: string;
-
   lastFundingSeq?: string;
 }
 
@@ -41,13 +39,11 @@ export function serializeSnapshot(
   userBalance: Map<string, UserBalance>,
   userPosition: Map<string, UserPosition>,
   lastSeq: bigint,
-  lastBalanceSeq: bigint,
   lastFundingSeq: bigint,
 ): EngineSnapshot {
   return {
     orderbook,
     lastSeq: lastSeq.toString(),
-    lastBalanceSeq: lastBalanceSeq.toString(),
     lastFundingSeq: lastFundingSeq.toString(),
     userBalance: Array.from(userBalance.entries()).map(([userId, b]) => [
       userId,

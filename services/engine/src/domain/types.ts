@@ -2,9 +2,7 @@ import type { Decimal } from "@repo/types";
 
 export type OrderSide = "LONG" | "SHORT";
 
-
 export type PositionSide = OrderSide | "UNINITIALIZED";
-
 
 export type OrderAction =
   | "LIMIT-CREATE"
@@ -19,12 +17,11 @@ export interface Order {
   seq?: string;
   userId: string;
   side: OrderSide;
-  entryPrice: number;
-  quantity: number;
+  entryPrice: string;
+  quantity: string;
   leverage: number;
-  filled: number;
+  filled: string;
 }
-
 
 export type BalanceAction = "BALANCE-DEPOSIT" | "BALANCE-WITHDRAW";
 
@@ -44,11 +41,10 @@ export interface Fill {
   userId: string;
   otherUserId: string;
   otherOrderId: string;
-  price: number;
-  quantity: number;
+  price: string;
+  quantity: string;
   otherLeverage: number;
 }
-
 
 export interface UserBalance {
   availableBalance: Decimal;
@@ -66,7 +62,6 @@ export interface UserPosition {
   leverage?: number;
 }
 
-
 export type DepthLevel = [string, string];
 
 export interface MarketDepth {
@@ -75,7 +70,7 @@ export interface MarketDepth {
 }
 
 export interface MatchResult {
-  executedQty: number;
+  executedQty: Decimal;
   fills: Fill[];
 
   updatedOrders: Order[];

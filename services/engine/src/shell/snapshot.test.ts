@@ -33,13 +33,12 @@ describe("engine snapshot round-trip (S3 recovery)", () => {
       ],
     ]);
 
-    const snap = serializeSnapshot(EMPTY_BOOK, balances, positions, 42n, 9n, 17n);
+    const snap = serializeSnapshot(EMPTY_BOOK, balances, positions, 42n, 17n);
 
 
     expect(typeof snap.userBalance[0]![1].availableBalance).toBe("string");
     expect(typeof snap.userPosition[0]![1].quantity).toBe("string");
     expect(snap.lastSeq).toBe("42");
-    expect(snap.lastBalanceSeq).toBe("9");
     expect(snap.lastFundingSeq).toBe("17");
 
     const b = deserializeBalances(snap.userBalance);
@@ -58,13 +57,13 @@ describe("engine snapshot round-trip (S3 recovery)", () => {
       ["u1", { availableBalance: new Decimal("999999999999.99999999"), lockedBalance: new Decimal("0") }],
     ]);
 
-    const snap = serializeSnapshot(EMPTY_BOOK, balances, new Map(), 7n, 3n, 1n);
+    const snap = serializeSnapshot(EMPTY_BOOK, balances, new Map(), 7n, 1n);
     const roundTripped = JSON.parse(JSON.stringify(snap)) as typeof snap;
 
     const b = deserializeBalances(roundTripped.userBalance);
     expect(b.get("u1")!.availableBalance.toFixed(8)).toBe("999999999999.99999999");
     expect(BigInt(roundTripped.lastSeq)).toBe(7n);
-    expect(BigInt(roundTripped.lastBalanceSeq!)).toBe(3n);
+    expect(BigInt(roundTripped.lastFundingSeq!)).toBe(1n);
   });
 
   test("UNINITIALIZED (flat) positions round-trip without becoming a direction", () => {
@@ -84,7 +83,7 @@ describe("engine snapshot round-trip (S3 recovery)", () => {
       ],
     ]);
 
-    const snap = serializeSnapshot(EMPTY_BOOK, new Map(), positions, 0n, 0n, 0n);
+    const snap = serializeSnapshot(EMPTY_BOOK, new Map(), positions, 0n, 0n);
     const p = deserializePositions(snap.userPosition);
     expect(p.get("flat")!.side).toBe("UNINITIALIZED");
     expect(p.get("flat")!.quantity.isZero()).toBe(true);
