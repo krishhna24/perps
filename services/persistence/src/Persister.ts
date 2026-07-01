@@ -1,17 +1,21 @@
 import { prisma } from "@repo/db";
-
-
+import { Decimal } from "@repo/types";
 
 type PositionSide = "LONG" | "SHORT" | "UNINITIALIZED";
 
 interface OrderUpdateData {
   id?: string;
-  quantity: number;
-  filled: number;
+  quantity: string;
+  filled: string;
 }
 
 interface CancelOrderData {
   orderId: string;
+}
+
+interface RejectOrderData {
+  orderId: string;
+  reason: string;
 }
 
 interface DepthUpdateData {
@@ -36,15 +40,14 @@ interface FillUpdateData {
   userId: string;
   otherUserId: string;
   otherOrderId: string;
-  price: number;
-  quantity: number;
+  price: string;
+  quantity: string;
   otherLeverage: number;
 }
 
 interface PositionUpdateData {
   userId: string;
   side: PositionSide;
-
 
   quantity: string;
   entryPrice: string;
@@ -57,9 +60,6 @@ interface PositionUpdateData {
 const MARKET_SYMBOL = "BTCUSDT";
 
 let marketIdPromise: Promise<string> | null = null;
-
-
-
 
 function getMarketId(): Promise<string> {
   if (!marketIdPromise) {
@@ -85,8 +85,13 @@ function isUniqueConstraintViolation(error: unknown): boolean {
 
 async function persistOrderUpdate(data: OrderUpdateData): Promise<void> {
   if (!data.id) return;
-  const status =
-    data.filled >= data.quantity ? "FILLED" : data.filled > 0 ? "PARTIALLY_FILLED" : "PENDING";
+  const quantity = new Decimal(data.quantity);
+  const filled = new Decimal(data.filled);
+  const status = filled.greaterThanOrEqualTo(quantity)
+    ? "FILLED"
+    : filled.greaterThan(0)
+      ? "PARTIALLY_FILLED"
+      : "PENDING";
   await prisma.order.update({
     where: { id: data.id },
     data: { filledQuantity: data.filled, status },
@@ -94,16 +99,20 @@ async function persistOrderUpdate(data: OrderUpdateData): Promise<void> {
 }
 
 async function persistCancelOrder(data: CancelOrderData): Promise<void> {
-  await prisma.order.update({
-    where: { id: data.orderId },
+  await prisma.order.updateMany({
+    where: { id: data.orderId, status: { in: ["PENDING", "PARTIALLY_FILLED"] } },
     data: { status: "CANCELLED" },
   });
 }
 
+async function persistRejectOrder(data: RejectOrderData): Promise<void> {
+  await prisma.order.updateMany({
+    where: { id: data.orderId, status: { in: ["PENDING", "PARTIALLY_FILLED"] } },
+    data: { status: "REJECTED" },
+  });
+}
+
 async function persistBalanceUpdate(data: BalanceUpdateData): Promise<void> {
-
-
-
 
   await prisma.balance.update({
     where: { userId: data.userId },
@@ -116,9 +125,6 @@ async function persistBalanceUpdate(data: BalanceUpdateData): Promise<void> {
 
 async function persistLedgerUpdate(data: LedgerUpdateData): Promise<void> {
 
-
-
-
   await prisma.ledgerEntry.update({
     where: { id: data.ledgerId },
     data: { status: data.status },
@@ -130,7 +136,6 @@ async function persistFillUpdate(data: FillUpdateData): Promise<void> {
   try {
     await prisma.fill.create({
       data: {
-
 
         id: data.fillId,
         marketId,
@@ -151,9 +156,6 @@ async function persistFillUpdate(data: FillUpdateData): Promise<void> {
 
 async function persistPositionUpdate(data: PositionUpdateData): Promise<void> {
   const marketId = await getMarketId();
-
-
-
 
   const size =
     data.side === "LONG" ? data.quantity : data.side === "SHORT" ? `-${data.quantity}` : "0";
@@ -186,8 +188,6 @@ async function persistPositionUpdate(data: PositionUpdateData): Promise<void> {
 
 async function persistDepthUpdate(data: DepthUpdateData): Promise<void> {
 
-
-
   const marketId = await getMarketId();
   await prisma.depth.upsert({
     where: { id: marketId },
@@ -195,7 +195,6 @@ async function persistDepthUpdate(data: DepthUpdateData): Promise<void> {
     update: { bids: data.bids, asks: data.asks },
   });
 }
-
 
 export async function persistEvent(type: string, data: unknown): Promise<void> {
   switch (type) {
@@ -210,6 +209,9 @@ export async function persistEvent(type: string, data: unknown): Promise<void> {
       break;
     case "CANCEL_ORDER":
       await persistCancelOrder(data as CancelOrderData);
+      break;
+    case "ORDER_REJECTED":
+      await persistRejectOrder(data as RejectOrderData);
       break;
     case "FILL_UPDATE":
       await persistFillUpdate(data as FillUpdateData);

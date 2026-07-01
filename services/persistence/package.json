@@ -13,6 +13,7 @@
   "dependencies": {
     "@repo/db": "*",
     "@repo/queue": "*",
+    "@repo/types": "*",
     "dotenv": "^16.5.0"
   },
   "devDependencies": {
