@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { logger } from "@repo/logger";
 import { Worker } from "@repo/queue";
 import { Decimal } from "@repo/types";
@@ -28,10 +29,7 @@ const worker = new Worker(
       leverage?: number;
     };
 
-
     const closingSide = order.side === "LONG" ? "SHORT" : "LONG";
-
-
 
     let leverage = order.leverage ?? 0;
     if (!leverage) {
@@ -43,22 +41,29 @@ const worker = new Worker(
     if (!Number.isFinite(leverage)) leverage = 1;
     leverage = Math.min(125, Math.max(1, leverage));
 
-
-
-
+    const rawBody = JSON.stringify({
+      userId: order.userId,
+      marketId: process.env["MARKET_ID"],
+      side: closingSide,
+      orderType: "MARKET",
+      quantity: order.liquidationQty,
+      leverage,
+    });
+    const timestamp = Date.now().toString();
+    const signature = crypto
+      .createHmac("sha256", process.env["INTERNAL_SERVICE_KEY"] as string)
+      .update(`${timestamp}.${rawBody}`)
+      .digest("hex");
 
     await axios.post(
       `${process.env["API_URL"]}/api/orders/internal/liquidate`,
+      rawBody,
       {
-        userId: order.userId,
-        marketId: process.env["MARKET_ID"],
-        side: closingSide,
-        orderType: "MARKET",
-        quantity: order.liquidationQty,
-        leverage,
-      },
-      {
-        headers: { "X-Internal-Key": process.env["INTERNAL_SERVICE_KEY"] },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Internal-Timestamp": timestamp,
+          "X-Internal-Signature": signature,
+        },
       },
     );
   },
@@ -69,11 +74,6 @@ const worker = new Worker(
     },
   },
 );
-
-
-
-
-
 
 const STUCK_THRESHOLD = 3;
 let consecutiveFailures = 0;
