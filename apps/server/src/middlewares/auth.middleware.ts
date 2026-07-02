@@ -19,7 +19,11 @@ export const authMiddleware = (
   }
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
+    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string; ws?: boolean };
+    if (decoded.ws === true) {
+      res.status(401).json({ message: "Unauthorized" });
+      return;
+    }
     req.userId = decoded.userId;
     next();
   } catch {
