@@ -3,39 +3,66 @@ import { RedisManager } from "@repo/pubsub";
 import { emitIndexPrice } from "./priceBus.js";
 
 const STREAM = "btcusdt@markPrice";
-const RECONNECT_DELAY_MS = 2000;
+const BASE_RECONNECT_MS = 1000;
+const MAX_RECONNECT_MS = 30000;
 
-export function connectBinanceFeed(): void {
+interface MarkPriceMessage {
+  p: string;
+  i: string;
+  r: string;
+  T: number;
+}
+
+function isMarkPriceMessage(v: unknown): v is MarkPriceMessage {
+  if (!v || typeof v !== "object") return false;
+  const m = v as Record<string, unknown>;
+  return (
+    typeof m["p"] === "string" &&
+    typeof m["i"] === "string" &&
+    typeof m["r"] === "string" &&
+    typeof m["T"] === "number"
+  );
+}
+
+export function connectBinanceFeed(attempt = 0): void {
   const ws = new WebSocket(`wss://fstream.binance.com/ws/${STREAM}`);
 
-  ws.on("open", () => console.log("Binance WS connected"));
+  const reconnect = (): void => {
+    const ceiling = Math.min(BASE_RECONNECT_MS * 2 ** attempt, MAX_RECONNECT_MS);
+    const delay = Math.random() * ceiling;
+    console.warn(`Binance WS reconnecting in ${Math.round(delay)}ms (attempt ${attempt + 1})`);
+    setTimeout(() => connectBinanceFeed(attempt + 1), delay);
+  };
 
-
-
-  ws.on("close", () => {
-    console.warn(`Binance WS closed — reconnecting in ${RECONNECT_DELAY_MS}ms`);
-    setTimeout(connectBinanceFeed, RECONNECT_DELAY_MS);
+  ws.on("open", () => {
+    attempt = 0;
+    console.log("Binance WS connected");
   });
 
+  ws.on("close", reconnect);
+
   ws.on("message", (raw) => {
-    const message = JSON.parse(raw.toString()) as {
-      p: string;
-      i: string;
-      r: string;
-      T: number;
-    };
-
-
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw.toString());
+    } catch {
+      console.warn("Binance WS: dropping non-JSON frame");
+      return;
+    }
+    if (!isMarkPriceMessage(parsed)) {
+      console.warn("Binance WS: dropping frame with unexpected shape");
+      return;
+    }
 
     RedisManager.getInstance().publishToChannel("prices:update", {
       s: "btcusdt",
-      m: message.p,
-      i: message.i,
-      r: message.r,
-      T: message.T,
+      m: parsed.p,
+      i: parsed.i,
+      r: parsed.r,
+      T: parsed.T,
     });
 
-    emitIndexPrice(message.i);
+    emitIndexPrice(parsed.i);
   });
 
   ws.on("error", (error) => console.error("Binance WS error:", error));

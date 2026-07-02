@@ -3,6 +3,7 @@ import { fundingQueue } from "@repo/queue";
 import { getLatestFunding } from "./fundingRateCache.js";
 
 const SETTLEMENT_CRON = "0 0,8,16 * * *";
+const FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000;
 
 export function startFundingScheduler(): cron.ScheduledTask {
   const task = cron.schedule(
@@ -14,13 +15,12 @@ export function startFundingScheduler(): cron.ScheduledTask {
         return;
       }
 
-
-
-      const settlementSeq = Date.now().toString();
+      const windowId = Math.floor(Date.now() / FUNDING_INTERVAL_MS);
+      const settlementSeq = windowId.toString();
       void fundingQueue.add(
         "apply_funding",
         { ...snapshot, settlementSeq },
-        { jobId: `funding__${settlementSeq}` },
+        { jobId: `funding__${windowId}` },
       );
       console.log("funding settlement enqueued:", { ...snapshot, settlementSeq });
     },
