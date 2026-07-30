@@ -57,7 +57,6 @@ export interface UserPosition {
   entryPrice: Decimal;
   margin: Decimal;
   unrealizedPnl: Decimal;
-  liquidatedPrice: Decimal;
   market: string;
   leverage?: number;
 }

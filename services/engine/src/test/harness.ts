@@ -40,7 +40,6 @@ export function seedUsers(engine: EngineLike, users: string[], available: number
       entryPrice: new Decimal(0),
       margin: new Decimal(0),
       unrealizedPnl: new Decimal(0),
-      liquidatedPrice: new Decimal(0),
       market: "BTCUSDT",
       leverage: 1,
     });

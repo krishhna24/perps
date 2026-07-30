@@ -1,11 +1,9 @@
 import { prisma } from "../src/index.js";
 
-
 const MARKET_ID = process.env.MARKET_ID ?? "cmqgd206q00002bxy0wavuaff";
 
 async function main(): Promise<void> {
   const config = {
-
 
     symbol: "BTCUSDT",
     baseAsset: "BTC",
@@ -14,12 +12,10 @@ async function main(): Promise<void> {
     lotSize: "0.001",
     minQty: 0n,
     maxLeverage: 125,
-    maintenanceMarginRate: 50n,
+    maintenanceMarginRate: 500n,
     takerFeeBps: 0,
     makerFeeBps: 0,
   };
-
-
 
   const market = await prisma.market.upsert({
     where: { id: MARKET_ID },

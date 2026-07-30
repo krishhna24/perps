@@ -6,8 +6,6 @@ import type {
   UserPosition,
 } from "../domain/types.js";
 
-
-
 interface SerializedBalance {
   availableBalance: string;
   lockedBalance: string;
@@ -19,7 +17,6 @@ interface SerializedPosition {
   entryPrice: string;
   margin: string;
   unrealizedPnl: string;
-  liquidatedPrice: string;
   market: string;
   leverage?: number;
 }
@@ -60,7 +57,6 @@ export function serializeSnapshot(
         entryPrice: p.entryPrice.toString(),
         margin: p.margin.toString(),
         unrealizedPnl: p.unrealizedPnl.toString(),
-        liquidatedPrice: p.liquidatedPrice.toString(),
         market: p.market,
         leverage: p.leverage,
       },
@@ -94,7 +90,6 @@ export function deserializePositions(
         entryPrice: new Decimal(p.entryPrice),
         margin: new Decimal(p.margin),
         unrealizedPnl: new Decimal(p.unrealizedPnl),
-        liquidatedPrice: new Decimal(p.liquidatedPrice),
         market: p.market,
         leverage: p.leverage,
       },

@@ -5,6 +5,11 @@ import { Decimal } from "@repo/types";
 import { logger } from "@repo/logger";
 import dotenv from "dotenv";
 import { Orderbook } from "./domain/Orderbook.js";
+import {
+  computeLiquidationPrice,
+  maintenanceMarginRateFromBps,
+  DEFAULT_MAINTENANCE_MARGIN_RATE,
+} from "./domain/risk.js";
 import { downloadSnapshot, uploadSnapshot } from "./S3Manager.js";
 import {
   deserializeBalances,
@@ -29,6 +34,10 @@ const SNAPSHOT_INTERVAL_MS = 3000;
 
 const SNAPSHOT_WRITE_THRESHOLD = 200;
 
+const SNAPSHOT_FAILURE_THRESHOLD = 2;
+
+const MARKET_ID = process.env["MARKET_ID"];
+
 export class Engine {
   public static instance: Engine | null = null;
   private orderbook: Orderbook | null;
@@ -43,7 +52,11 @@ export class Engine {
   private fundingWorker: Worker | null = null;
   private snapshotInFlight = false;
 
+  private consecutiveSnapshotFailures = 0;
+
   private writesSinceSnapshot = 0;
+
+  private maintenanceMarginRate = DEFAULT_MAINTENANCE_MARGIN_RATE;
 
   private replaying = false;
 
@@ -66,6 +79,7 @@ export class Engine {
 
     const engine = new Engine();
     try {
+      await engine.loadMarketRiskConfig();
 
       const snapshot = await downloadSnapshot<EngineSnapshot>(ENGINE_KEY);
       if (snapshot) {
@@ -89,6 +103,36 @@ export class Engine {
     engine.startWorker();
     engine.startSnapshotLoop();
     return engine;
+  }
+
+  async loadMarketRiskConfig(): Promise<void> {
+    if (!MARKET_ID) {
+      logger.warn(
+        `MARKET_ID is not set — using default maintenance margin rate ` +
+          `${this.maintenanceMarginRate.times(100)}%`,
+      );
+      return;
+    }
+    try {
+      const market = await prisma.market.findUnique({
+        where: { id: MARKET_ID },
+        select: { symbol: true, maintenanceMarginRate: true },
+      });
+      if (!market) {
+        logger.warn(
+          `market ${MARKET_ID} not found — using default maintenance margin rate ` +
+            `${this.maintenanceMarginRate.times(100)}%`,
+        );
+        return;
+      }
+      this.maintenanceMarginRate = maintenanceMarginRateFromBps(market.maintenanceMarginRate);
+      logger.info(
+        `engine loaded risk config for ${market.symbol} — ` +
+          `maintenance margin ${this.maintenanceMarginRate.times(100)}%`,
+      );
+    } catch (error) {
+      logger.error("failed to load market risk config; keeping default rate:", error);
+    }
   }
 
   loadSnapshot(snapshot: EngineSnapshot) {
@@ -128,6 +172,7 @@ export class Engine {
 
   private startSnapshotLoop() {
     this.snapshotTimer = setInterval(() => {
+      if (this.writesSinceSnapshot === 0) return;
       void this.saveSnapshot();
     }, SNAPSHOT_INTERVAL_MS);
   }
@@ -136,6 +181,7 @@ export class Engine {
     if (this.snapshotInFlight || !this.orderbook) return;
     this.snapshotInFlight = true;
     try {
+      const captured = this.writesSinceSnapshot;
       const snapshot = serializeSnapshot(
         this.orderbook.getSnapshot(),
         this.userBalance,
@@ -145,12 +191,21 @@ export class Engine {
       );
       await uploadSnapshot(snapshot, ENGINE_KEY);
 
-      this.writesSinceSnapshot = 0;
+      this.writesSinceSnapshot -= captured;
+      this.consecutiveSnapshotFailures = 0;
     } catch (error) {
-      logger.error("snapshot save failed:", error);
+      this.consecutiveSnapshotFailures += 1;
+      logger.error(
+        `snapshot save failed (${this.consecutiveSnapshotFailures} consecutive):`,
+        error,
+      );
     } finally {
       this.snapshotInFlight = false;
     }
+  }
+
+  snapshotHealthy(): boolean {
+    return this.consecutiveSnapshotFailures < SNAPSHOT_FAILURE_THRESHOLD;
   }
 
   private noteWrite(): void {
@@ -426,7 +481,6 @@ export class Engine {
         entryPrice: new Decimal(0),
         margin: new Decimal(0),
         unrealizedPnl: new Decimal(0),
-        liquidatedPrice: new Decimal(0),
         market: "BTCUSDT",
         leverage: 1,
       });
@@ -783,7 +837,8 @@ export class Engine {
       entryPrice: p.entryPrice.toFixed(8),
       margin: p.margin.toFixed(8),
       unrealizedPnl: p.unrealizedPnl.toFixed(8),
-      liquidatedPrice: p.liquidatedPrice.toFixed(8),
+      liquidatedPrice: computeLiquidationPrice(p, this.maintenanceMarginRate).toFixed(8),
+      maintenanceMarginRate: this.maintenanceMarginRate.toString(),
       market: p.market,
       leverage: p.leverage,
     };

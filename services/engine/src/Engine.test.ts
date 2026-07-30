@@ -113,7 +113,6 @@ function setPosition(
     entryPrice: d(entryPrice),
     margin: d(margin),
     unrealizedPnl: d(0),
-    liquidatedPrice: d(0),
     market: "BTCUSDT",
     leverage: 1,
   });
