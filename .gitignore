@@ -7,16 +7,18 @@ node_modules
 .env.local
 .env.development.local
 .env.test.local
+.env.production
 .env.production.local
 
-engine-plan.md
 coverage
 
 .turbo
 
-analysis.md
-docs
 .vercel
+
+analysis.md
+engine-plan.md
+docs
 
 .next/
 out/

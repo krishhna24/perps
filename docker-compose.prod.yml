@@ -1,0 +1,285 @@
+
+x-images:
+  backend: &backend-image ghcr.io/krishhna24/perps/backend@${BACKEND_DIGEST:?set BACKEND_DIGEST (sha256:… from the CI run summary)}
+  web: &web-image ghcr.io/krishhna24/perps/web@${WEB_DIGEST:?set WEB_DIGEST (sha256:… from the CI run summary)}
+  migrate: &migrate-image ghcr.io/krishhna24/perps/migrate@${MIGRATE_DIGEST:?set MIGRATE_DIGEST (sha256:… from the CI run summary)}
+
+x-app-env: &app-env
+  NODE_ENV: production
+  DATABASE_URL: postgresql://perps:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/perps
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+
+  S3_ENDPOINT: ${S3_ENDPOINT:?set S3_ENDPOINT (https://<account>.r2.cloudflarestorage.com)}
+  AWS_REGION: auto
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?set AWS_ACCESS_KEY_ID (R2 access key)}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?set AWS_SECRET_ACCESS_KEY (R2 secret)}
+
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET}
+  INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY:?set INTERNAL_SERVICE_KEY}
+  MARKET_ID: ${MARKET_ID:?set MARKET_ID (must match the seeded market)}
+
+x-app: &app
+  image: *backend-image
+  restart: unless-stopped
+  init: true
+  deploy:
+    replicas: 1
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    migrate: { condition: service_completed_successfully }
+  logging: &logging
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+x-worker-healthcheck: &worker-healthcheck
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: perps
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: perps
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U perps"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits: { memory: 2G }
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
+    ports: ["127.0.0.1:6379:6379"]
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits: { memory: 1G }
+    logging: *logging
+
+  migrate:
+    image: *migrate-image
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgresql://perps:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/perps
+      MARKET_ID: ${MARKET_ID:?set MARKET_ID}
+    logging: *logging
+
+  server:
+    <<: *app
+    environment:
+      <<: *app-env
+      PORT: "3000"
+      CORS_ORIGIN: ${PUBLIC_WEB_ORIGIN:?set PUBLIC_WEB_ORIGIN (https://perps.example.com)}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      replicas: 1
+      resources:
+        limits: { memory: 768M }
+
+  engine:
+    <<: *app
+    environment:
+      <<: *app-env
+      S3_BUCKET: ${ENGINE_BUCKET:-perps-engine}
+      ENGINE_KEY: engine-snapshot.json
+      HEALTH_PORT: "3010"
+    healthcheck:
+      <<: *worker-healthcheck
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://localhost:3010/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+    deploy:
+      replicas: 1
+      resources:
+        limits: { memory: 1536M }
+
+  persistence:
+    <<: *app
+    environment:
+      <<: *app-env
+      S3_BUCKET: ${EVENTS_BUCKET:-perps-events}
+      HEALTH_PORT: "3011"
+    healthcheck:
+      <<: *worker-healthcheck
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://localhost:3011/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+    deploy:
+      replicas: 1
+      resources:
+        limits: { memory: 768M }
+
+  websocket:
+    <<: *app
+    environment:
+      <<: *app-env
+      PORT: "8080"
+      HEALTH_PORT: "3012"
+      WS_ALLOWED_ORIGINS: ${PUBLIC_WEB_ORIGIN:?set PUBLIC_WEB_ORIGIN}
+      WS_HEARTBEAT_INTERVAL_MS: "30000"
+    healthcheck:
+      <<: *worker-healthcheck
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://localhost:3012/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+    deploy:
+      replicas: 1
+      resources:
+        limits: { memory: 1G }
+
+  mark-price-engine:
+    <<: *app
+    environment:
+      <<: *app-env
+      HEALTH_PORT: "3013"
+    healthcheck:
+      <<: *worker-healthcheck
+      start_period: 60s
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://localhost:3013/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+    deploy:
+      replicas: 1
+      resources:
+        limits: { memory: 384M }
+
+  liquidation-engine:
+    <<: *app
+    environment:
+      <<: *app-env
+      API_URL: http://server:3000
+      HEALTH_PORT: "3014"
+    healthcheck:
+      <<: *worker-healthcheck
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://localhost:3014/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+    deploy:
+      replicas: 1
+      resources:
+        limits: { memory: 384M }
+
+  funding-rate-scheduler:
+    <<: *app
+    environment:
+      <<: *app-env
+      HEALTH_PORT: "3015"
+    healthcheck:
+      <<: *worker-healthcheck
+      start_period: 90s
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://localhost:3015/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+    deploy:
+      replicas: 1
+      resources:
+        limits: { memory: 256M }
+
+  web:
+    image: *web-image
+    restart: unless-stopped
+    init: true
+    depends_on:
+      server: { condition: service_healthy }
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://localhost:3001/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      replicas: 1
+      resources:
+        limits: { memory: 768M }
+    logging: *logging
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN}"]
+    depends_on:
+      server: { condition: service_healthy }
+      web: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M }
+    logging: *logging
+
+volumes:
+  postgres_data:
+  redis_data:
