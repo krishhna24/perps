@@ -52,15 +52,16 @@ app.get("/health", async (_req, res) => {
     await withTimeout(prisma.$queryRaw`SELECT 1`, 1000);
     checks.postgres = true;
   } catch {
+    checks.postgres = false;
   }
   try {
-
     const client = (await withTimeout(eventQueue.client, 1000)) as unknown as {
       ping: () => Promise<string>;
     };
     await withTimeout(client.ping(), 1000);
     checks.redis = true;
   } catch {
+    checks.redis = false;
   }
   const ok = checks.postgres && checks.redis;
   res.status(ok ? 200 : 503).json({ status: ok ? "ok" : "degraded", checks });
