@@ -17,6 +17,8 @@ export function emitIndexPrice(index: IndexPrice): void {
   bus.emit("index", index);
 }
 
+const NO_BOOK: TopOfBook = { a: ["0", "0"], b: ["0", "0"] };
+
 export default function onMarketDataUpdate(
   handler: (data: { top: TopOfBook; index: IndexPrice }) => void,
 ): void {
@@ -32,8 +34,6 @@ export default function onMarketDataUpdate(
 
   bus.on("index", (index: IndexPrice) => {
     latestIndex = index;
-    if (latestTop !== null) {
-      handler({ top: latestTop, index });
-    }
+    handler({ top: latestTop ?? NO_BOOK, index });
   });
 }
