@@ -16,6 +16,14 @@ interface PremiumSample {
 
 const premiumWindow: PremiumSample[] = [];
 
+let lastPublishedAt = 0;
+
+const MARK_STALE_AFTER_MS = 30_000;
+
+export function markPriceFresh(): boolean {
+  return lastPublishedAt > 0 && Date.now() - lastPublishedAt < MARK_STALE_AFTER_MS;
+}
+
 onMarketDataUpdate(({ top, index }) => {
   try {
     const idx = new Decimal(index);
@@ -38,6 +46,7 @@ onMarketDataUpdate(({ top, index }) => {
       fundingRate: fundingRate.toString(),
       markPrice: markPrice.toString(),
     });
+    lastPublishedAt = Date.now();
   } catch (error) {
     console.error("Error processing market data update:", error);
   }

@@ -11,6 +11,7 @@
     "check-types": "tsc --noEmit"
   },
   "dependencies": {
+    "@repo/health": "*",
     "@repo/pubsub": "*",
     "@repo/types": "*",
     "dotenv": "^16.5.0",

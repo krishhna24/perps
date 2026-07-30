@@ -100,6 +100,20 @@
         "typescript-eslint": "^8.50.0",
       },
     },
+    "packages/health": {
+      "name": "@repo/health",
+      "version": "0.0.0",
+      "dependencies": {
+        "@repo/logger": "*",
+      },
+      "devDependencies": {
+        "@repo/eslint-config": "*",
+        "@repo/typescript-config": "*",
+        "@types/node": "^22.15.3",
+        "eslint": "^9.39.1",
+        "typescript": "5.9.2",
+      },
+    },
     "packages/logger": {
       "name": "@repo/logger",
       "version": "0.0.0",
@@ -168,6 +182,7 @@
       "dependencies": {
         "@aws-sdk/client-s3": "^3.1062.0",
         "@repo/db": "*",
+        "@repo/health": "*",
         "@repo/logger": "*",
         "@repo/pubsub": "*",
         "@repo/queue": "*",
@@ -188,6 +203,7 @@
       "name": "@repo/funding-rate-scheduler",
       "version": "0.0.0",
       "dependencies": {
+        "@repo/health": "*",
         "@repo/pubsub": "*",
         "@repo/queue": "*",
         "dotenv": "^16.5.0",
@@ -207,6 +223,7 @@
       "name": "@repo/liquidation-engine",
       "version": "0.0.0",
       "dependencies": {
+        "@repo/health": "*",
         "@repo/logger": "*",
         "@repo/pubsub": "*",
         "@repo/queue": "*",
@@ -227,6 +244,7 @@
       "name": "@repo/mark-price-engine",
       "version": "0.0.0",
       "dependencies": {
+        "@repo/health": "*",
         "@repo/pubsub": "*",
         "@repo/types": "*",
         "dotenv": "^16.5.0",
@@ -247,6 +265,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@repo/db": "*",
+        "@repo/health": "*",
         "@repo/queue": "*",
         "@repo/types": "*",
         "dotenv": "^16.5.0",
@@ -264,6 +283,7 @@
       "name": "@repo/websocket",
       "version": "0.0.0",
       "dependencies": {
+        "@repo/health": "*",
         "@repo/pubsub": "*",
         "dotenv": "^16.5.0",
         "jsonwebtoken": "^9.0.2",
@@ -597,6 +617,8 @@
     "@repo/eslint-config": ["@repo/eslint-config@workspace:packages/eslint-config"],
 
     "@repo/funding-rate-scheduler": ["@repo/funding-rate-scheduler@workspace:services/funding-rate-scheduler"],
+
+    "@repo/health": ["@repo/health@workspace:packages/health"],
 
     "@repo/liquidation-engine": ["@repo/liquidation-engine@workspace:services/liquidation-engine"],
 

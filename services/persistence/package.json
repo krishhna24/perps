@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@repo/db": "*",
+    "@repo/health": "*",
     "@repo/queue": "*",
     "@repo/types": "*",
     "dotenv": "^16.5.0"
